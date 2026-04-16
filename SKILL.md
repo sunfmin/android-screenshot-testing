@@ -173,6 +173,25 @@ AppState.currentUser = testUser
 AppState.selectedConfig = testConfig
 ```
 
+**Standalone Activity pattern:** For Activities launched directly (not via fragment navigation in MainActivity), `onCreate` may immediately kick off coroutines that read singleton state. If `onCreate` resets state (e.g., refreshes stock locations from a native library unavailable on JVM), those coroutines see stale/empty data. Fix by re-triggering the ViewModel after correcting state:
+
+```kotlin
+val scenario = ActivityScenario.launch(CheckoutActivity::class.java)
+idleSafe()
+
+// Fix state that onCreate's native-library call wiped
+Cart.items.forEach { it.stockLocation = DELIVERY_STORE }
+
+// Re-trigger ViewModel so coroutines see corrected state
+scenario.onActivity { activity ->
+    val vm = ViewModelProvider(activity)[CheckoutViewModel::class.java]
+    vm.buildDisplayItems(true)
+}
+
+// Then idle to let coroutines + MockWebServer complete
+repeat(20) { idleSafe(); Thread.sleep(200) }
+```
+
 ### 5. Views depend on user authentication state
 
 Many views check authentication status and render differently (or skip rendering) for unauthenticated users.
@@ -212,7 +231,11 @@ BaseScreenshotTest
 │   └── idleSafe()
 ├── Reflection utilities:
 │   └── setPrivateField, setAtomicBoolean, etc.
-└── Screenshot: forceSoftwareRendering + draw + PNG save
+└── Screenshot capture:
+    ├── captureScreenshot(scenario, name)             ← single viewport
+    ├── captureScrollingScreenshots(scenario, rvId, name) ← per-viewport scroll
+    ├── forceSoftwareRendering(view)
+    └── saveScreenshot(bitmap, name)
 ```
 
 Subclasses typically need only 50-90 lines of page-specific code.
@@ -237,6 +260,64 @@ rootView.draw(Canvas(bitmap))
 bitmap.compress(Bitmap.CompressFormat.PNG, 100, FileOutputStream(file))
 ```
 
+### Capture strategies
+
+**Single viewport** — use `captureScreenshot(scenario, name)` for pages that fit in one screen.
+
+**Scrolling pages** — use `captureScrollingScreenshots(scenario, rvId, name)` to scroll a RecyclerView one viewport at a time, saving each as `{name}_1.png`, `{name}_2.png`, etc.
+
+```kotlin
+fun <T : Activity> captureScrollingScreenshots(
+    scenario: ActivityScenario<T>,
+    scrollableViewId: Int,
+    screenshotName: String
+) {
+    scenario.onActivity { activity ->
+        val rootView = activity.window.decorView.rootView
+        forceSoftwareRendering(rootView)
+        activity.findViewById<RecyclerView?>(scrollableViewId)?.scrollToPosition(0)
+    }
+    idleSafe()
+
+    var pageIndex = 1
+    var canScroll = true
+    while (canScroll) {
+        scenario.onActivity { activity ->
+            val rootView = activity.window.decorView.rootView
+            val rv = activity.findViewById<RecyclerView>(scrollableViewId)
+            val bitmap = Bitmap.createBitmap(rootView.width, rootView.height, Bitmap.Config.ARGB_8888)
+            rootView.draw(Canvas(bitmap))
+            saveScreenshot(bitmap, "${screenshotName}_$pageIndex")
+            bitmap.recycle()
+            if (rv.canScrollVertically(1)) rv.scrollBy(0, rv.height) else canScroll = false
+        }
+        idleSafe()
+        pageIndex++
+    }
+}
+```
+
+**Why per-viewport, not scroll-stitch:** Stitching strips into one tall image produces a compressed, hard-to-read PNG. Per-viewport captures are actual phone-sized screenshots — readable at a glance and easy to review in conversation or CI.
+
+### Multi-state capture
+
+Capture the same page in different UI states within one test. Change the state, rebind, capture again with a different name:
+
+```kotlin
+// Capture collapsed state
+captureScrollingScreenshots(scenario, R.id.recyclerView, "checkout_collapsed")
+
+// Toggle state, rebind adapter, capture expanded state
+scenario.onActivity { activity ->
+    val vm = ViewModelProvider(activity)[MyViewModel::class.java]
+    vm.items.value?.forEach { it.uiState.sectionExpanded = true }
+    activity.findViewById<RecyclerView>(R.id.recyclerView).adapter?.notifyDataSetChanged()
+}
+repeat(5) { idleSafe(); Thread.sleep(100) }
+
+captureScrollingScreenshots(scenario, R.id.recyclerView, "checkout_expanded")
+```
+
 ### Why `xxhdpi` qualifier matters
 
 Without it, Robolectric defaults to mdpi (1x). A 1080px-wide canvas at mdpi = 1080dp — a giant tablet. At xxhdpi (3x), 1080px = 360dp — a real phone. Text, spacing, and layouts all render at correct proportions.
@@ -252,6 +333,8 @@ Without it, Robolectric defaults to mdpi (1x). A 1080px-wide canvas at mdpi = 10
 | Expect real image decoding | Robolectric shows "Failed to create image decoder". Use `generateTestImage()` for colored placeholders |
 | Wait with `Thread.sleep` only | Must also call `Shadows.shadowOf(Looper.getMainLooper()).idle()` to process messages |
 | Missing `@GraphicsMode(NATIVE)` | Without native graphics mode, views render as empty bitmaps |
+| Standalone Activity has empty adapter | `onCreate` may reset state + trigger coroutines before you fix it. Re-trigger ViewModel after correcting state |
+| Stitch screenshots into one tall image | Produces compressed, unreadable PNGs. Use per-viewport capture instead |
 
 ## Running
 
@@ -275,4 +358,5 @@ open build/test-results/screenshots/my_page.png
 - **Output directory:** Save PNGs to a consistent directory (e.g., `build/test-results/screenshots/`) for easy CI artifact collection
 - **Visual diffing:** Compare PNGs across commits using tools like `pixelmatch`, `reg-suit`, or simple `diff` on file hashes
 - **Multiple states:** Capture the same page in different states (empty, loading, error, populated) by varying MockWebServer responses
+- **UI state toggles:** Capture collapsed/expanded, selected/unselected states in a single test by mutating ViewModel data + `notifyDataSetChanged()` between captures
 - **Screen sizes:** Run the same test with different `@Config(qualifiers = ...)` to test tablet/phone layouts
