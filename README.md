@@ -52,6 +52,7 @@ Claude will apply the patterns from this skill — MockWebServer setup, Robolect
 | Five Problems | SDK crashes, KeyStore, URL redirect, singleton lifecycle, auth state |
 | Base Class Design | Reusable test infrastructure pattern |
 | Screenshot Capture | Software rendering, bitmap capture, xxhdpi explained |
+| Asserting on Rendered Content | Text and visibility assertions: binding access, view-tree walks, Espresso, when-to-use matrix |
 | Common Mistakes | Pitfalls and fixes table |
 | Scaling Tips | Naming conventions, CI artifacts, visual diffing, multi-state/multi-size |
 

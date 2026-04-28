@@ -1,6 +1,6 @@
 ---
 name: android-screenshot-testing
-description: Use when writing Android integration tests that render real UI pages and capture screenshots on JVM without emulators. Use when needing visual verification of Android screens, testing full UI rendering pipelines, or setting up Robolectric-based screenshot infrastructure for any Android project. Triggers on "screenshot test", "render page test", "Robolectric screenshot", "visual test without emulator", "integration test with screenshot", "Android JVM screenshot".
+description: Use when writing Android integration tests that render real UI pages and capture screenshots on JVM without emulators. Also covers asserting on rendered content (text, visibility, i18n sweeps) alongside the captured PNG. Use when needing visual verification of Android screens, testing full UI rendering pipelines, or setting up Robolectric-based screenshot infrastructure for any Android project. Triggers on "screenshot test", "render page test", "Robolectric screenshot", "visual test without emulator", "integration test with screenshot", "Android JVM screenshot", "assert text in screenshot test", "verify rendered text".
 ---
 
 # Android Screenshot Testing on JVM
@@ -322,6 +322,124 @@ captureScrollingScreenshots(scenario, R.id.recyclerView, "checkout_expanded")
 
 Without it, Robolectric defaults to mdpi (1x). A 1080px-wide canvas at mdpi = 1080dp — a giant tablet. At xxhdpi (3x), 1080px = 360dp — a real phone. Text, spacing, and layouts all render at correct proportions.
 
+## Asserting on Rendered Content
+
+A PNG alone is a weak signal. A wrong string, an unsubstituted `@string/foo` placeholder, or text drawn in the wrong color can all slip through casual review. Text-level assertions complement the screenshot by failing the build the moment the rendered tree contains the wrong content — and they double as inline documentation of what the screen should say.
+
+Three approaches, in order of preference:
+
+### 1. Direct binding access (preferred for targeted checks)
+
+You already hold the inflated view binding (or can `findViewById` on the activity). Read text and visibility directly:
+
+```kotlin
+@Test
+fun renderTakeBeforeSlotRowWithHintIcon() {
+    val controller = Robolectric.buildActivity(HostActivity::class.java)
+        .create().start().resume().visible()
+    val activity = controller.get()
+    val binding = activity.binding
+
+    // Visibility
+    assertEquals(View.VISIBLE, binding.takeBeforeSlotQuestionMark.visibility)
+
+    // Exact text
+    assertEquals(
+        "指定時間より前の受け取り OK",
+        binding.takeBeforeSlotCheckText.text.toString()
+    )
+
+    // Catch unresolved string references
+    assertFalse(
+        binding.takeBeforeSlotCheckText.text.contains("@string/"),
+        "untranslated string placeholder rendered"
+    )
+
+    saveScreenshot(activity, "checkout_slot_dialog_with_hint")
+    controller.pause().stop().destroy()
+}
+```
+
+Use this when you know which view/ID to check — fast, exact, no extra dependencies.
+
+### 2. View-tree walk (preferred for sweeps across the page)
+
+When you don't want to hard-code every TextView — e.g., "no untranslated strings anywhere on this page", "no debug stubs", "every required label is present" — walk the tree and collect:
+
+```kotlin
+fun collectTextViews(view: View, out: MutableList<TextView> = mutableListOf()): List<TextView> {
+    if (view is TextView) out += view
+    if (view is ViewGroup) {
+        for (i in 0 until view.childCount) collectTextViews(view.getChildAt(i), out)
+    }
+    return out
+}
+
+@Test
+fun noUntranslatedStringsOnCheckout() = launchAndCapture("checkout") { scenario ->
+    scenario.onActivity { activity ->
+        val texts = collectTextViews(activity.window.decorView.rootView)
+            .map { it.text.toString() }
+            .filter { it.isNotBlank() }
+
+        texts.forEach { text ->
+            assertFalse(text.startsWith("@string/"))   { "untranslated: $text" }
+            assertFalse(text.contains("TODO:"))        { "stub left in: $text" }
+            assertFalse(text.contains("Lorem ipsum"))  { "placeholder copy: $text" }
+        }
+
+        // Required-content checks
+        assertTrue(texts.any { it.contains("配送オプション") }) {
+            "expected 配送オプション section header"
+        }
+    }
+}
+```
+
+The same walk works for collecting all `ImageView`s (verify icons load), all `Button`s (verify enabled state), or any view subclass.
+
+### 3. Espresso `onView(withText(...))` (only if already in the project)
+
+Espresso runs in Robolectric and reads naturally:
+
+```kotlin
+testImplementation 'androidx.test.espresso:espresso-core:3.7.0'
+```
+
+```kotlin
+onView(withText("指定時間より前の受け取り OK")).check(matches(isDisplayed()))
+onView(withId(R.id.takeBeforeSlotQuestionMark)).check(matches(isDisplayed()))
+```
+
+It adds a dependency and is more ceremony than a tree walk for what's really the same operation. Prefer it only if Espresso is already pulled in for instrumented tests.
+
+### When to assert vs. screenshot only
+
+| Signal | Screenshot | Assertion |
+|--------|:---------:|:---------:|
+| Layout, spacing, alignment | ✓ | — (hard to express) |
+| Specific copy / labels | weak | ✓ |
+| i18n / translation completeness | weak | ✓ (tree-walk + `@string/` check) |
+| Visibility of icons / badges | ✓ | ✓ (assert `View.VISIBLE`) |
+| Color / theming | ✓ | — (brittle in code) |
+| State after interaction | ✓ | ✓ |
+
+Pair them: assertions fail loudly with a clear message in CI; the screenshot gives reviewers something to inspect when something else regresses. A test that only saves a PNG and never asserts is a test that depends on a human noticing the diff.
+
+### Asserting alongside scrolling captures
+
+When you also use `captureScrollingScreenshots`, run the assertions on the activity *before* scrolling — the tree mutates as views recycle, and a TextView you saw at scroll position 0 may be detached by the time you reach the bottom:
+
+```kotlin
+scenario.onActivity { activity ->
+    val texts = collectTextViews(activity.window.decorView.rootView).map { it.text.toString() }
+    assertTrue(texts.any { it == "確定" })
+}
+captureScrollingScreenshots(scenario, R.id.recyclerView, "checkout")
+```
+
+For content that only appears after scrolling, capture first, then drive the RecyclerView back to the relevant position and assert.
+
 ## Common Mistakes
 
 | Mistake | Fix |
@@ -335,6 +453,8 @@ Without it, Robolectric defaults to mdpi (1x). A 1080px-wide canvas at mdpi = 10
 | Missing `@GraphicsMode(NATIVE)` | Without native graphics mode, views render as empty bitmaps |
 | Standalone Activity has empty adapter | `onCreate` may reset state + trigger coroutines before you fix it. Re-trigger ViewModel after correcting state |
 | Stitch screenshots into one tall image | Produces compressed, unreadable PNGs. Use per-viewport capture instead |
+| Test only saves a PNG, no assertions | Wrong text and untranslated `@string/` placeholders pass silently. Pair captures with text/visibility assertions |
+| Assert against text on a recycled view | RecyclerView detaches off-screen TextViews. Capture first, then assert against the live tree before scrolling |
 
 ## Running
 
@@ -360,3 +480,4 @@ open build/test-results/screenshots/my_page.png
 - **Multiple states:** Capture the same page in different states (empty, loading, error, populated) by varying MockWebServer responses
 - **UI state toggles:** Capture collapsed/expanded, selected/unselected states in a single test by mutating ViewModel data + `notifyDataSetChanged()` between captures
 - **Screen sizes:** Run the same test with different `@Config(qualifiers = ...)` to test tablet/phone layouts
+- **Pair captures with assertions:** Every screenshot test should also assert at least one piece of expected text or visibility. Screenshots catch layout regressions; assertions catch wrong text, missing translations, and silent content drift
